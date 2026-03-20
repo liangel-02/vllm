@@ -3,6 +3,7 @@
 """Attention layer with FlexAttention."""
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
 from typing import ClassVar
@@ -337,6 +338,9 @@ class FlexAttentionMetadata:
     transformed_score_mod: _score_mod_signature | None = None
     sliding_window: int | None = None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
+    block_sparsity_hint: (
+        Callable[[torch.Tensor, torch.Tensor, int], torch.Tensor] | None
+    ) = None
 
     @cached_property
     def logical_block_ids(self):
@@ -380,7 +384,7 @@ class FlexAttentionMetadata:
 
         return is_valid, logical_q_idx, logical_kv_idx
 
-    def get_causal_mask_mod(self) -> _mask_mod_signature:
+    def get_paged_mask_mod(self) -> _mask_mod_signature:
         """Creates the mask_mod function for FlexAttention.
 
         This function creates the combined mask mod function that handles:
@@ -506,8 +510,9 @@ class FlexAttentionMetadata:
     def get_mask_mod(self):
         # Stage-1: initialize the base mask_mod
         # (causal mask for decoder or bidirectional mask for encoder)
-        if self.causal:
-            mask_mod = self.get_causal_mask_mod()
+        has_custom_mask = self.logical_mask_mod is not causal_mask_mod
+        if self.causal or has_custom_mask:
+            mask_mod = self.get_paged_mask_mod()
         else:
             mask_mod = self.get_bidirectional_mask_mod()
         # stage-2: add external mask_mod for special attention during
@@ -593,7 +598,10 @@ class FlexAttentionMetadata:
             self.doc_ids, : cdiv(self.max_seq_len, self.block_size)
         ]
 
-        if self.sliding_window and self.causal:
+        causal_sliding_window = self.sliding_window and self.causal
+        custom_hint = self.block_sparsity_hint is not None
+
+        if causal_sliding_window or custom_hint:
             device = used_pages.device
             assert self.doc_ids is not None
             token_indices = torch.arange(
@@ -604,10 +612,24 @@ class FlexAttentionMetadata:
                 - self.query_start_loc[self.doc_ids]
                 + self.decode_offset[self.doc_ids]
             )
-            min_kv_idx = torch.clamp(logical_q_idx - (self.sliding_window - 1), min=0)
-            min_block_idx = min_kv_idx // self.block_size
-            sliding_mask = self.logical_block_ids >= min_block_idx[:, None]
-            used_pages.masked_fill_(~sliding_mask, 0)
+
+            if causal_sliding_window:
+                assert self.sliding_window is not None
+                min_kv_idx = torch.clamp(
+                    logical_q_idx - (self.sliding_window - 1), min=0
+                )
+                min_block_idx = min_kv_idx // self.block_size
+                sliding_mask = self.logical_block_ids >= min_block_idx[:, None]
+                used_pages.masked_fill_(~sliding_mask, 0)
+            if custom_hint:
+                assert self.block_sparsity_hint is not None
+                q_block_idx = logical_q_idx // self.block_size
+                hint_mask = self.block_sparsity_hint(
+                    q_block_idx[:, None],
+                    self.logical_block_ids[None, :],
+                    self.block_size,
+                )
+                used_pages.masked_fill_(~hint_mask, 0)
 
         used_pages_padded = pad_to_multiple(
             used_pages, multiple=self.q_block_size, dim=0
@@ -661,11 +683,6 @@ class FlexAttentionMetadata:
 
         self.mask_mod = self.get_mask_mod()
         self.transformed_score_mod = self.get_transformed_score_mod()
-
-        if self.direct_build and self.causal:
-            self.block_mask = self._build_block_mask_direct()
-        else:
-            self.block_mask = self.build_block_mask()
 
 
 class FlexAttentionMetadataBuilder(AttentionMetadataBuilder[FlexAttentionMetadata]):
@@ -772,6 +789,8 @@ class FlexAttentionImpl(AttentionImpl):
     alibi_slopes: torch.Tensor | None
     logits_soft_cap: float | None
     mm_prefix_range: dict[int, list[tuple[int, int]]] | None = None
+    logical_mask_mod: _mask_mod_signature | None = None
+    block_sparsity_hint: Callable | None = None
 
     def __init__(
         self,
@@ -909,8 +928,25 @@ class FlexAttentionImpl(AttentionImpl):
             attn_metadata.mask_mod = attn_metadata.get_mask_mod()
             needs_rebuild_block_mask = True
 
-        if needs_rebuild_block_mask:
-            if attn_metadata.direct_build and attn_metadata.causal:
+        layer_mask_mod = getattr(layer, "logical_mask_mod", None)
+        if (
+            layer_mask_mod is not None
+            and attn_metadata.logical_mask_mod is not layer_mask_mod
+        ):
+            attn_metadata.logical_mask_mod = layer_mask_mod
+            attn_metadata.mask_mod = attn_metadata.get_mask_mod()
+            needs_rebuild_block_mask = True
+
+        layer_hint = getattr(layer, "block_sparsity_hint", None)
+        if (
+            layer_hint is not None
+            and attn_metadata.block_sparsity_hint is not layer_hint
+        ):
+            attn_metadata.block_sparsity_hint = layer_hint
+            needs_rebuild_block_mask = True
+
+        if needs_rebuild_block_mask or attn_metadata.block_mask is None:
+            if attn_metadata.direct_build:
                 attn_metadata.block_mask = attn_metadata._build_block_mask_direct()
             else:
                 attn_metadata.block_mask = attn_metadata.build_block_mask()
